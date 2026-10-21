@@ -1,4 +1,6 @@
+-- Added: Keep the chosen port filter for the host-wide banner check.
 local local_port_rule
+-- Changed: Start with a three-second wait; check user input before using it.
 local validated_timeout_ms = 3000
 local comm = require "comm"
 local nmap = require "nmap"
@@ -48,6 +50,7 @@ if portarg then
   end
   -- ensure TCP
   portarg = portarg:gsub("^[T:]*", "T:")
+  -- Changed: Use this filter inside the host scan instead of running once per port.
   local_port_rule = shortport.port_range(portarg)
 else
   local_port_rule = function(host, port) return port.protocol == "tcp" end
@@ -56,6 +59,7 @@ end
 
 ---
 -- Grabs a banner and outputs it nicely formatted.
+-- Changed: Keep the old action here; the new action below compares several ports.
 local original_banner_action = function( host, port )
 
   local out = grab_banner(host, port)
@@ -79,6 +83,7 @@ function grab_banner(host, port)
     end
   end
 
+  -- Changed: Use the timeout checked by the new action below.
   local opts = {timeout = validated_timeout_ms}
 
   local status, response = comm.get_banner(host, port, opts)
@@ -208,7 +213,7 @@ function extra_output()
   return (nmap.verbosity()-nmap.debugging()>0 and nmap.verbosity()-nmap.debugging()) or 0
 end
 
--- ENHANCEMENT: validated host-level evidence and cross-port comparison.
+-- Added: Check that number inputs are whole numbers within the allowed range.
 local function integer_arg(name, default, lower, upper)
   local raw = stdnse.get_script_args(SCRIPT_NAME .. "." .. name)
   if raw == nil then return default end
@@ -219,32 +224,37 @@ local function integer_arg(name, default, lower, upper)
   return n
 end
 
+-- Added: Run once per host when at least one TCP port is open.
 hostrule = function(host)
   return nmap.get_ports(host, nil, "tcp", "open") ~= nil
 end
 
 action = function(host)
+  -- Added: Check how many ports to sample and how many replies are needed.
   local sample, err = integer_arg("sample_size", 5, 2, 64)
   if not sample then return "ERROR: " .. err end
   local minimum
   minimum, err = integer_arg("min_responses", 2, 2, sample)
   if not minimum then return "ERROR: " .. err end
+  -- Added: Reject invalid timeouts and allow only 0.05 to 60 seconds.
   local raw = stdnse.get_script_args(SCRIPT_NAME .. ".timeout")
   local ok, timeout = pcall(stdnse.parse_timespec, raw or "3s")
   if not ok or not timeout or timeout ~= timeout or timeout < 0.05 or timeout > 60 then
     return "ERROR: timeout must be 0.05..60 seconds, e.g. 3000ms or 3s"
   end
-  -- Passed to the inherited banner collector. Every host uses the same arguments.
+  -- Added: Convert seconds to milliseconds for the banner collector.
   validated_timeout_ms = timeout * 1000
   local result = stdnse.output_table()
   result.requested_ports = sample
   result.minimum_responses = minimum
   local observations, banners, selected = {}, {}, {}
   local port = nmap.get_ports(host, nil, "tcp", "open")
+  -- Added: Collect banners from matching open ports up to the sample limit.
   while port and #selected < sample do
     if local_port_rule(host, port) then
       selected[#selected + 1] = port.number
       local banner = grab_banner(host, port)
+      -- Added: Record each port's banner or explain why no banner was received.
       local row = stdnse.output_table()
       row.port = port.number
       if banner and #banner > 0 then
@@ -259,13 +269,16 @@ action = function(host)
     end
     port = nmap.get_ports(host, port, "tcp", "open")
   end
+  -- Added: Show which ports were checked and count received and missing replies.
   result.sampled_ports = table.concat(selected, ", ")
   result.responding_ports = #banners
   result.missing_responses = #selected - #banners
   result.observations = observations
+  -- Added: Do not draw a conclusion when replies are missing or too few.
   if #banners < minimum or #banners < #selected then
     result.verdict = "INCONCLUSIVE: insufficient usable responses"
   else
+    -- Added: Compare every collected banner with the first one.
     local same = true
     for i = 2, #banners do
       if banners[i] ~= banners[1] then same = false; break end
@@ -275,6 +288,7 @@ action = function(host)
       and "IDENTICAL BANNERS: possible honeypot pattern; verify manually"
       or "DIFFERENT BANNERS: no identical-response pattern in this sample"
   end
+  -- Added: Explain that matching banners alone do not prove a honeypot.
   result.interpretation = "Compared collected banners after trimming surrounding whitespace; this does not confirm or exclude a honeypot."
   return result
 end

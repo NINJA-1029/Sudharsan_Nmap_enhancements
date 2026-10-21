@@ -123,8 +123,7 @@ local tdist = {
   { 0.6770, 1.2901, 1.6602,  1.9840,  2.3642,  2.6259,   3.3905 }  -- 100
 }
 
--- cache ports to probe between the hostrule and the action function
--- Port lists are now local to each action, not shared between hosts.
+-- Changed: Keep a separate port list for each host so hosts do not share it.
 
 
 local tinv = function(p, dof)
@@ -183,6 +182,7 @@ local tstat = function(n1, n2, u1, u2, v1, v2)
   local a = (n1 + n2) / (n1 * n2)
   --local b = ((n1 - 1) * (s1 * s1) + (n2 - 1) * (s2 * s2))
   local b = ((n1 - 1) * v1) + ((n2 - 1) * v2)
+  -- Added: Avoid dividing by zero when the timing values have no variation.
   if b == 0 then return u1 == u2 and 0 or math.huge end
   return math.abs(u1 - u2) / math.sqrt(a * (b / dof))
 end
@@ -233,6 +233,7 @@ local calcfamilies = function(stats, conf)
   local stat
   local crit
 
+  -- Changed: Only group ports that have at least two timing replies.
   for _, i in pairs(stats) do repeat
     if i.fam ~= -1 or i.num < 2 then
       break
@@ -272,8 +273,10 @@ local report = function(stats)
   local port, fam, mean, stddev, loss
   for _, j in pairs(stats) do
     port = tostring(j.port)
+    -- Changed: Show N/A when there are too few replies to calculate a result.
     fam = j.num >= 2 and tostring(j.fam) or "N/A"
     mean = j.num > 0 and string.format("%.2f", j.mean) or "N/A"
+    -- Added: Prevent tiny rounding errors from causing a negative square root.
     stddev = j.num >= 2 and string.format("%.2f", math.sqrt(math.max(0, j.K / (j.num - 1)))) or "N/A"
     loss = string.format("%.1f%%", 100 * (1 - j.num / j.sent))
 
@@ -295,6 +298,7 @@ local getopts = function()
   local bool, err
   local k
 
+  -- Changed: Try this script's argument prefix first, then the old qscan names.
   for _, k in ipairs({SCRIPT_NAME .. ".confidence", "qscan.confidence", "confidence"}) do
     if nmap.registry.args[k] then
       conf = tonumber(nmap.registry.args[k])
@@ -325,11 +329,13 @@ local getopts = function()
     err = "Invalid confidence level"
   end
 
+  -- Added: Reject invalid delays and values outside zero to 60 seconds.
   if not delay or delay ~= delay or delay < 0 or delay > 60 then
     bool = false
     err = "Invalid delay"
   end
 
+  -- Added: Require a whole number of timing attempts between 3 and 1000.
   if not numtrips or numtrips ~= numtrips or numtrips < 3 or numtrips > 1000 or numtrips % 1 ~= 0 then
     bool = false
     err = "Invalid number of trips (integer 3..1000 required)"
@@ -382,6 +388,7 @@ local getports = function(host, numopen, numclosed)
   return table_extend(open, closed)
 end
 
+-- Changed: Keep the original timing scan in its own function with this host's ports.
 local timing_action = function(host, qscanports)
   local sock = nmap.new_dnet()
   local pcap = nmap.new_socket()
@@ -477,7 +484,7 @@ local timing_action = function(host, qscanports)
 end
 
 
--- ENHANCEMENT: connection reliability alongside the inherited timing report.
+-- Added: Read number options, use defaults, and reject values outside their limits.
 local function number_arg(name, default, lower, upper, integral, legacy)
   local raw = stdnse.get_script_args(SCRIPT_NAME .. "." .. name)
   if raw == nil and legacy then
@@ -491,12 +498,14 @@ local function number_arg(name, default, lower, upper, integral, legacy)
   return n
 end
 
+-- Added: Let the user choose timing checks, connection checks, or both.
 local function enhancement_options()
   local opts = {}
   opts.mode = stdnse.get_script_args(SCRIPT_NAME .. ".mode") or "both"
   if opts.mode ~= "both" and opts.mode ~= "timing" and opts.mode ~= "connect" then
     return nil, "mode must be both, timing, or connect"
   end
+  -- Added: Set and check limits for retries, waits, failure rate, and port counts.
   for _, spec in ipairs({
     {"attempts", 8, 2, 100, true}, {"timeout", 3000, 50, 60000, true},
     {"interval", 0.5, 0, 10, false}, {"failure_threshold", 20, 0.001, 100, false},
@@ -509,11 +518,14 @@ local function enhancement_options()
   return opts
 end
 
+-- Changed: Allow connection checks even when raw-packet privileges are unavailable.
+-- The timing checks below still require those privileges.
 hostrule = function(host)
   return nmap.get_ports(host, nil, "tcp", "open") ~= nil
     or nmap.get_ports(host, nil, "tcp", "closed") ~= nil
 end
 
+-- Added: Try connecting to each port several times to check its reliability.
 local function connection_report(host, port, opts)
   local row = stdnse.output_table()
   row.port, row.attempts = port, opts.attempts
@@ -527,6 +539,7 @@ local function connection_report(host, port, opts)
     local status, err = socket:connect(host, port, "tcp")
     local duration = stdnse.clock_ms() - start
     socket:close() -- Close on every path, including timeout and other failures.
+    -- Added: Record success, timeout, or another failure for each attempt.
     local success = not not status
     if success then
       succeeded = succeeded + 1
@@ -539,16 +552,21 @@ local function connection_report(host, port, opts)
       failed = failed + 1
       sequence[#sequence + 1] = "F"
     end
+    -- Added: Count switches between a successful and an unsuccessful connection.
     if previous ~= nil and previous ~= success then transitions = transitions + 1 end
     previous = success
+    -- Added: Wait between attempts using the interval chosen by the user.
     if i < opts.attempts and opts.interval > 0 then stdnse.sleep(opts.interval) end
   end
+  -- Added: Calculate the failure rate and report the order of connection results.
   local rate = 100 * (failed + timed_out) / opts.attempts
   row.succeeded, row.failed, row.timed_out = succeeded, failed, timed_out
   row.failure_percent = string.format("%.1f", rate)
   row.success_failure_transitions = transitions
   row.sequence = table.concat(sequence, " ")
+  -- Added: Average only successful connection times; show N/A if none succeed.
   row.mean_success_connect_ms = succeeded > 0 and string.format("%.2f", total_ms / succeeded) or "N/A"
+  -- Added: Label reliability using the failure rate and the chosen threshold.
   row.verdict = succeeded == 0 and "UNREACHABLE DURING SAMPLE"
     or rate == 0 and "STABLE"
     or rate < opts.failure_threshold and "MOSTLY STABLE"
@@ -556,6 +574,7 @@ local function connection_report(host, port, opts)
   return row
 end
 
+-- Added: Check user options and run the selected checks for this host.
 action = function(host)
   local opts, err = enhancement_options()
   if not opts then return "ERROR: " .. err end
@@ -563,7 +582,9 @@ action = function(host)
   if opts.mode ~= "connect" then
     local valid, why = getopts()
     if not valid then return "ERROR: " .. why end
+    -- Changed: Build a fresh port list for this host's timing check.
     local ports = getports(host, opts.numopen, opts.numclosed)
+    -- Added: Explain why timing is skipped while still allowing connection checks.
     if not nmap.is_privileged() or nmap.address_family() ~= "inet" or not host.interface then
       result.timing = "SKIPPED: qscan requires raw-packet privileges, IPv4, and a usable interface"
     elseif #ports < 2 then
@@ -572,12 +593,14 @@ action = function(host)
       result.timing = timing_action(host, ports)
     end
   end
+  -- Added: Run connection checks only on ports found open in the initial scan.
   if opts.mode ~= "timing" then
     local ports = getports(host, opts.numopen, 0)
     local rows = {}
     for _, port in ipairs(ports) do rows[#rows + 1] = connection_report(host, port, opts) end
     result.connections = #rows > 0 and rows or "No initially open TCP ports selected"
     result.sequence_key = "S=successful TCP connect, T=timeout, F=other failure"
+    -- Added: Explain that connection failures do not prove port-state changes.
     result.interpretation = "Connection outcomes are not application health or proven port-state transitions. Raw probe loss and connection failure are different measurements."
   end
   return result
